@@ -84,10 +84,14 @@ func OpenLevelDB(path string) (leveldb *LevelDB, err error) {
 	// allocate LevelDB Option struct to open
 	opt := C.leveldb_options_create()
 	defer C.leveldb_free(unsafe.Pointer(opt))
-
+	cache:=C.leveldb_cache_create_lru(300*1024*1024);
 	// set open option
 	C.leveldb_options_set_create_if_missing(opt, C.uchar(1))
 	C.leveldb_options_set_info_log(opt,nil);
+	C.leveldb_options_set_write_buffer_size(opt,30*1024*1024);
+	C.leveldb_options_set_block_size(opt,30*1024*1024);
+	C.leveldb_options_set_compression(opt,C.leveldb_snappy_compression);
+	C.leveldb_options_set_cache(opt,cache);
 
 	// open leveldb
 	var cerr *C.char
@@ -155,7 +159,7 @@ func (db *LevelDB) Get(key string) (value string, err error) {
 	}
 
 	defer C.leveldb_free(unsafe.Pointer(cvalue))
-	return C.GoString(cvalue), nil
+	return C.GoStringN(cvalue,C.int(vallen)), nil
 }
 
 func (db *LevelDB) Delete(key string) (err error) {
