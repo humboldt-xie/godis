@@ -1,11 +1,11 @@
 package main
 import (
-	"github.com/humboldt_xie/godis/leveldb"
+	"github.com/humboldt-xie/godis/leveldb"
 	"bufio"
 	"flag"
 	"fmt"
 	"net"
-	redis "github.com/humboldt_xie/godis/redis"
+	redis "github.com/humboldt-xie/godis/redis"
 )
 
 var g_port int
