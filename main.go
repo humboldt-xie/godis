@@ -8,8 +8,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	//	redis "github.com/humboldt-xie/godis/redis"
-	//	node "github.com/humboldt-xie/godis/dataserver"
 )
 
 var g_port int
@@ -25,6 +23,7 @@ type HandlerFn func(c net.Conn, rc *redis.Conn, r *redis.Package) error
 type Server struct {
 	methods map[string]HandlerFn
 	db      *leveldb.LevelDB
+	Channel chan *redis.Package
 }
 
 func (srv *Server) Register(name string, fn HandlerFn) {
@@ -66,8 +65,8 @@ func (srv *Server) CopyData(host string, port string) {
 			log.Printf("Error:%s\n", err)
 			return
 		}
-		//fmt.Printf("copy %s %s %s %s \n", p.GetString(0), p.GetString(1), p.GetString(2), p.GetString(3))
-		if p.GetLower(0) == "put" {
+		//log.Printf("copy:%s %s\n", p.GetString(0), p.GetString(1))
+		if p.GetLower(0) == "put" || p.GetLower(0) == "set" {
 			key := p.GetString(1)
 			value := p.GetString(2)
 			srv.db.Put(key, value)
@@ -96,6 +95,7 @@ func main() {
 	var svc Server
 	db, _ := leveldb.OpenLevelDB("db-" + fmt.Sprintf("%d", g_port))
 	svc.db = db
+	svc.Channel = make(chan *redis.Package, 1000)
 
 	svc.Register("SET", func(c net.Conn, rc *redis.Conn, r *redis.Package) error {
 		if r.Count() < 3 {
@@ -110,6 +110,7 @@ func main() {
 			_, err := rc.WriteError("FAILED")
 			return err
 		}
+		svc.Channel <- r
 		_, err = rc.WriteLine("OK")
 		return err
 	})
@@ -149,9 +150,27 @@ func main() {
 			if err != nil {
 				return err
 			}
+			select {
+			case r := <-svc.Channel:
+				if r.GetString(1) < iter.Key() {
+					_, err := rc.WriteMultiBytes(r.Data)
+					if err != nil {
+						return err
+					}
+				}
+				break
+			default:
+			}
 			iter.Next()
 		}
-		fmt.Printf("copy count:%d\n", i)
+		fmt.Printf("copy end count:%d start sync:\n", i)
+		for {
+			r := <-svc.Channel
+			_, err := rc.WriteMultiBytes(r.Data)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	e := svc.ListenAndServe(fmt.Sprintf("%s:%d", g_host, g_port))
