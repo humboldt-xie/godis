@@ -118,7 +118,6 @@ func NewServer(c *Config) (*Server, error) {
 	} else {
 		srv.Addr = fmt.Sprintf("%s:%d", c.host, c.port)
 	}
-
 	if c.handler == nil {
 		c.handler = NewDefaultHandler()
 	}

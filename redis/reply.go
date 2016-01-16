@@ -120,6 +120,9 @@ func MultiBulkFromMap(m map[string]interface{}) *MultiBulkReply {
 	return &MultiBulkReply{values: values}
 }
 
+func WriteMultiBytes(values []interface{}, w io.Writer) (int64, error) {
+	return writeMultiBytes(values,w);
+}
 func writeMultiBytes(values []interface{}, w io.Writer) (int64, error) {
 	if values == nil {
 		return 0, errors.New("Nil in multi bulk replies are not ok")

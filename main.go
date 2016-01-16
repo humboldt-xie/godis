@@ -1,110 +1,171 @@
 package main
+
 import (
-	"github.com/humboldt-xie/godis/leveldb"
-	"bufio"
 	"flag"
 	"fmt"
+	"github.com/humboldt-xie/godis/leveldb"
+	redis "github.com/humboldt-xie/redisio"
+	"log"
 	"net"
-	redis "github.com/humboldt-xie/godis/redis"
+	"strings"
+	//	redis "github.com/humboldt-xie/godis/redis"
+	//	node "github.com/humboldt-xie/godis/dataserver"
 )
 
 var g_port int
-func init () {
-	flag.IntVar(&g_port,"p",6389,"port")
+var g_host string
+
+func init() {
+	flag.IntVar(&g_port, "p", 6389, "port")
+	flag.StringVar(&g_host, "h", "127.0.0.1", "host")
 }
 
-type MyGodis struct{
-	db *leveldb.LevelDB
+type HandlerFn func(c net.Conn, rc *redis.Conn, r *redis.Package) error
+
+type Server struct {
+	methods map[string]HandlerFn
+	db      *leveldb.LevelDB
 }
 
-func NewMyGodis(path string) *MyGodis {
-	db,_:=leveldb.OpenLevelDB(path);
-	return &MyGodis{db};
-}
-
-func (h *MyGodis) GET(key string) ([]byte, error) {
-    v,err:=h.db.Get(key);
-	if err != nil {
-		return nil,err
+func (srv *Server) Register(name string, fn HandlerFn) {
+	if srv.methods == nil {
+		srv.methods = make(map[string]HandlerFn)
 	}
-    return []byte(v), nil
+	if fn != nil {
+		srv.methods[strings.ToLower(name)] = fn
+	}
 }
 
-func (h *MyGodis) SET(key string, value []byte) error {
-	return h.db.Put(key,string(value));
-}
-
-func (h *MyGodis ) AreYouMaster(key string) (string,error) {
-	return "yes",nil;
-}
-
-func (h *MyGodis ) AddMember(host string,value []byte) error{
-	fmt.Printf("add member:%s %s\n",host,value);
-	go h.dump(host,string(value),0)
-	return nil;
-}
-
-func (h *MyGodis) Monitor() (*redis.MonitorReply, error) {
-	return &redis.MonitorReply{}, nil
-}
-
-func (h *MyGodis) dump(host string,port string,index int){
-	conn,_:=net.Dial("tcp",host+":"+port)
-	bulk:=redis.MultiBulkFromMap(map[string]interface{}{"sync": []byte(fmt.Sprintf("%d",index))})
-	bulk.WriteTo(conn)
-	r := bufio.NewReader(conn)
+func (srv *Server) ServeClient(c net.Conn) error {
+	defer c.Close()
+	rc := redis.NewConn(c, c)
 	for {
-		request, err := redis.ParseRequest(conn,r)
+		p, err := rc.NewPackage()
 		if err != nil {
-			fmt.Printf("error %s \n",err)
-			return 
+			return err
 		}
-		if request.Name=="put" {
-			key,_:=request.GetString(0)
-			value,_:=request.GetString(1)
-			fmt.Printf("%s %s\n",key,value)
-			h.db.Put(key,value)
+		cmd := p.GetLower(0)
+		fn, exists := srv.methods[cmd]
+		if !exists {
+			_, err := rc.WriteError("ERR unknown command '" + cmd + "'")
+			return err
+		}
+		err = fn(c, rc, p)
+		if err != nil {
+			return err
 		}
 	}
-	return 
-
 }
-
-func (h *MyGodis)Sync(channel string, channels ...[]byte) (*redis.ChannelWriter, error){
-	output := make(chan []interface{})
-	writer := &redis.ChannelWriter{
-		FirstReply: []interface{}{
-			[]byte("sync"), // []byte
-			[]byte(channel),             // string
-			[]byte("1"),                   // int
-		},
-		Channel: output,
-	}
-	go func() {
-		iter:=h.db.Iter();
-		defer iter.Destroy();
-		iter.SeekToFirst()
-		for iter.Valid() {
-			output <- []interface{}{
-				[]byte("put"),
-				[]byte(iter.Key()),
-				[]byte(iter.Value()),
-			}
-			iter.Next()
+func (srv *Server) CopyData(host string, port string) {
+	conn, _ := net.Dial("tcp", host+":"+port)
+	rc := redis.NewConn(conn, conn)
+	rc.WriteMultiBytes([]interface{}{"sync", "0"})
+	for {
+		p, err := rc.NewPackage()
+		if err != nil {
+			log.Printf("Error:%s\n", err)
+			return
 		}
-		close(output)
-	}()
-	return writer, nil
-
+		//fmt.Printf("copy %s %s %s %s \n", p.GetString(0), p.GetString(1), p.GetString(2), p.GetString(3))
+		if p.GetLower(0) == "put" {
+			key := p.GetString(1)
+			value := p.GetString(2)
+			srv.db.Put(key, value)
+		}
+	}
 }
 
+func (srv *Server) ListenAndServe(addr string) error {
+	l, e := net.Listen("tcp", addr)
+	if e != nil {
+		return e
+	}
+	defer l.Close()
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		go srv.ServeClient(conn)
+	}
+}
 
 func main() {
 	flag.Parse()
-	mygodis:=NewMyGodis("db-"+fmt.Sprintf("%d",g_port));
-	c:=redis.DefaultConfig()
-	c.Handler(mygodis)
-	c.Port(g_port)
-    server,_ := redis.NewServer(c)
-    server.ListenAndServe()
+	fmt.Printf("listen %s:%d\n", g_host, g_port)
+	var svc Server
+	db, _ := leveldb.OpenLevelDB("db-" + fmt.Sprintf("%d", g_port))
+	svc.db = db
+
+	svc.Register("SET", func(c net.Conn, rc *redis.Conn, r *redis.Package) error {
+		if r.Count() < 3 {
+			_, err := rc.WriteError("ERR wrong number of arguments for 'set' command")
+			return err
+
+		}
+		key := r.GetString(1)
+		value := r.GetString(2)
+		err := db.Put(key, string(value))
+		if err != nil {
+			_, err := rc.WriteError("FAILED")
+			return err
+		}
+		_, err = rc.WriteLine("OK")
+		return err
+	})
+
+	svc.Register("GET", func(c net.Conn, rc *redis.Conn, r *redis.Package) error {
+		if r.Count() < 2 {
+			_, err := rc.WriteError("ERR wrong number of arguments for 'put' command")
+			return err
+
+		}
+		key := r.GetString(1)
+		v, err := db.Get(key)
+		if err != nil {
+			_, err := rc.WriteError("FAILED")
+			return err
+		}
+		_, err = rc.WriteBytes(v)
+		return err
+	})
+	svc.Register("slaveof", func(c net.Conn, rc *redis.Conn, r *redis.Package) error {
+		if r.Count() < 3 {
+			_, err := rc.WriteError("ERR wrong number of arguments for 'slaveof' command")
+			return err
+		}
+		go svc.CopyData(r.GetString(1), r.GetString(2))
+		_, err := rc.WriteLine("OK")
+		return err
+	})
+	svc.Register("sync", func(c net.Conn, rc *redis.Conn, r *redis.Package) error {
+		iter := db.Iter()
+		defer iter.Destroy()
+		iter.SeekToFirst()
+		i := 0
+		for ; iter.Valid(); i++ {
+			v := []interface{}{"put", string(iter.Key()), string(iter.Value())}
+			_, err := rc.WriteMultiBytes(v)
+			if err != nil {
+				return err
+			}
+			iter.Next()
+		}
+		fmt.Printf("copy count:%d\n", i)
+		return nil
+	})
+	e := svc.ListenAndServe(fmt.Sprintf("%s:%d", g_host, g_port))
+	fmt.Printf("Listen Error %s\n", e)
+
+	//mygodis:=node.NewDataServer("db-"+fmt.Sprintf("%d",g_port),g_host,g_port);
+	//c:=redis.DefaultConfig()
+	//c.Handler(mygodis)
+	//c.Port(g_port)
+	//c.Host(g_host)
+	//server,err := redis.NewServer(c)
+	//if server==nil {
+	//	fmt.Printf("%s\n",err)
+	//	return
+	//}
+	//server.ListenAndServe()
 }
